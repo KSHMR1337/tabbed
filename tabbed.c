@@ -2,7 +2,6 @@
  * See LICENSE file for copyright and license details.
  */
 
-#include <X11/X.h>
 #include <sys/wait.h>
 #include <locale.h>
 #include <signal.h>
@@ -11,12 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <linux/limits.h>
 #include <X11/Xatom.h>
+#include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xproto.h>
 #include <X11/Xutil.h>
 #include <X11/XKBlib.h>
 #include <X11/Xft/Xft.h>
+#include <X11/Xresource.h>
 
 #include "arg.h"
 
@@ -47,6 +49,19 @@
 #define LENGTH(x)               (sizeof((x)) / sizeof(*(x)))
 #define CLEANMASK(mask)         (mask & ~(numlockmask | LockMask))
 #define TEXTW(x)                (textnw(x, strlen(x)) + dc.font.height)
+
+#define XRESOURCE_LOAD_META(NAME)						\
+	if(!XrmGetResource(xrdb, "tabbed." NAME, "tabbed." NAME, &type, &ret))	\
+		XrmGetResource(xrdb, "*." NAME, "*." NAME, &type, &ret);	\
+	if (ret.addr != NULL && !strncmp("String", type, 64))
+
+#define XRESOURCE_LOAD_STRING(NAME, DST)	\
+	XRESOURCE_LOAD_META(NAME)		\
+	DST = ret.addr;
+
+#define XRESOURCE_LOAD_INTEGER(NAME, DST)	\
+	XRESOURCE_LOAD_META(NAME)		\
+	DST = atoi(ret.addr);
 
 enum { ColFG, ColBG, ColLast };       /* color */
 enum { WMProtocols, WMDelete, WMName, WMState, WMFullscreen,
@@ -81,15 +96,16 @@ typedef struct {
 
 typedef struct {
 	char name[256];
+	char *basename;
 	Window win;
 	int tabx;
 	Bool urgent;
 	Bool closed;
+	pid_t pid;
 } Client;
 
 /* function declarations */
 static void buttonpress(const XEvent *e);
-static void motionnotify(const XEvent *e);
 static void cleanup(void);
 static void clientmessage(const XEvent *e);
 static void configurenotify(const XEvent *e);
@@ -108,6 +124,7 @@ static void focusonce(const Arg *arg);
 static void focusurgent(const Arg *arg);
 static void fullscreen(const Arg *arg);
 static char *getatom(int a);
+static char *getbasename(const char *name);
 static int getclient(Window w);
 static XftColor getcolor(const char *colstr);
 static int getfirsttab(void);
@@ -115,7 +132,6 @@ static Bool gettextprop(Window w, Atom atom, char *text, unsigned int size);
 static void initfont(const char *fontstr);
 static Bool isprotodel(int c);
 static void keypress(const XEvent *e);
-static void keyrelease(const XEvent *e);
 static void killclient(const Arg *arg);
 static void manage(Window win);
 static void maprequest(const XEvent *e);
@@ -128,8 +144,6 @@ static void run(void);
 static void sendxembed(int c, long msg, long detail, long d1, long d2);
 static void setcmd(int argc, char *argv[], int);
 static void setup(void);
-static void sigchld(int unused);
-static void showbar(const Arg *arg);
 static void spawn(const Arg *arg);
 static int textnw(const char *text, unsigned int len);
 static void toggle(const Arg *arg);
@@ -139,6 +153,9 @@ static void updatenumlockmask(void);
 static void updatetitle(int c);
 static int xerror(Display *dpy, XErrorEvent *ee);
 static void xsettitle(Window w, const char *str);
+static void xrdb_load(void);
+static void reload(int sig);
+static void writecolors(void);
 
 /* variables */
 static int screen;
@@ -153,16 +170,14 @@ static void (*handler[LASTEvent]) (const XEvent *) = {
 	[Expose] = expose,
 	[FocusIn] = focusin,
 	[KeyPress] = keypress,
-	[KeyRelease] = keyrelease,
 	[MapRequest] = maprequest,
 	[PropertyNotify] = propertynotify,
-	[MotionNotify] = motionnotify,
 };
 static int bh, obh, wx, wy, ww, wh, vbh;
 static unsigned int numlockmask;
 static Bool running = True, nextfocus, doinitspawn = True,
             fillagain = False, closelastclient = False,
-            killclientsfirst = False;
+			killclientsfirst = False, basenametitles = False;
 static Display *dpy;
 static DC dc;
 static Atom wmatom[WMLast];
@@ -174,16 +189,61 @@ static int cmd_append_pos;
 static char winid[64];
 static char **cmd;
 static char *wmname = "tabbed";
+static pid_t nextpid;
 static const char *geometry;
-static Bool barvisibility = False;
 
 static Colormap cmap;
 static Visual *visual = NULL;
 
 char *argv0;
 
+static int colors_changed = 0;
+
 /* configuration, allows nested code to access above variables */
 #include "config.h"
+
+// Given a pid, return its cwd to buf
+int getpidcwd(pid_t pid, char* buf, size_t bufsiz) {
+	static const int proc_max = 20; // '/proc/4194304/cwd'
+	int sn_ret;
+	ssize_t rl_ret;
+	char path[proc_max];
+
+	sn_ret = snprintf(path, proc_max, "/proc/%d/cwd", pid);
+	if(sn_ret < 0 || sn_ret >= proc_max)
+		return -1;
+
+	rl_ret = readlink(path, buf, bufsiz);
+	if(rl_ret < 0 || rl_ret == bufsiz)
+		return -1;
+
+	buf[rl_ret] = 0;
+	return 0;
+}
+
+// Given a pid, return a reasonable guess at its child pid
+pid_t getchildpid(pid_t pid) {
+	// '/proc/4194304/task/4194304/children'
+	static const int proc_max = 40;
+	int sn_ret;
+	char path[proc_max];
+	FILE* f;
+
+	// guessing tid == pid
+	sn_ret = snprintf(path, proc_max, "/proc/%d/task/%d/children", pid, pid);
+	if (sn_ret < 0 || sn_ret >= proc_max)
+		return -1;
+
+	f = fopen(path, "r");
+	if(f == NULL)
+		return -1;
+
+	// guess first child
+	if(fscanf(f, "%d ", &pid) != 1)
+		return -1;
+
+	return pid;
+}
 
 void
 buttonpress(const XEvent *e)
@@ -220,46 +280,11 @@ buttonpress(const XEvent *e)
 }
 
 void
-motionnotify(const XEvent *e)
-{
-	const XMotionEvent *ev = &e->xmotion;
-	int i, fc;
-	Arg arg;
-
-	if (ev->y < 0 || ev->y > bh)
-		return;
-
-	if (! (ev->state & Button1Mask)) {
-		return;
-	}
-
-	if (((fc = getfirsttab()) > 0 && ev->x < TEXTW(before)) || ev->x < 0)
-		return;
-
-	if (sel < 0)
-		return;
-
-	for (i = fc; i < nclients; i++) {
-		if (clients[i]->tabx > ev->x) {
-			if (i == sel+1) {
-				arg.i = 1;
-				movetab(&arg);
-			}
-			if (i == sel-1) {
-				arg.i = -1;
-				movetab(&arg);
-			}
-			break;
-		}
-	}
-}
-
-void
 cleanup(void)
 {
 	int i;
 
-	for (i = 0; i < nclients; i++) {
+	for (i = nclients - 1; i >= 0; i--) {
 		focus(i);
 		killclient(NULL);
 		XReparentWindow(dpy, clients[i]->win, root, 0, 0);
@@ -369,28 +394,30 @@ void
 drawbar(void)
 {
 	XftColor *col;
-	int c, cc, fc, width, nbh;
+	int c, cc, fc, width, nbh, i;
 	char *name = NULL;
 
-	nbh = barvisibility ? vbh : 0;
-	if (nbh != bh) {
-		bh = nbh;
-		for (c = 0; c < nclients; c++)
-			XMoveResizeWindow(dpy, clients[c]->win, 0, bh, ww, wh-bh);
-	}
-
-	if (bh == 0) return;
+	if (colors_changed == 1) writecolors();
 
 	if (nclients == 0) {
 		dc.x = 0;
 		dc.w = ww;
 		XFetchName(dpy, win, &name);
 		drawtext(name ? name : "", dc.norm);
-		XCopyArea(dpy, dc.drawable, win, dc.gc, 0, 0, ww, bh, 0, 0);
+		XCopyArea(dpy, dc.drawable, win, dc.gc, 0, 0, ww, vbh, 0, 0);
 		XSync(dpy, False);
 
 		return;
 	}
+
+	nbh = nclients > 1 ? vbh : 0;
+	if (bh != nbh) {
+		bh = nbh;
+		for (i = 0; i < nclients; i++)
+			XMoveResizeWindow(dpy, clients[i]->win, 0, bh, ww, wh - bh);
+		}
+	if (bh == 0)
+		return;
 
 	width = ww;
 	cc = ww / tabwidth;
@@ -421,7 +448,10 @@ drawbar(void)
 		} else {
 			col = clients[c]->urgent ? dc.urg : dc.norm;
 		}
-		drawtext(clients[c]->name, col);
+		if (basenametitles)
+			drawtext(clients[c]->basename, col);
+		else
+			drawtext(clients[c]->name, col);
 		dc.x += dc.w;
 		clients[c]->tabx = dc.x;
 	}
@@ -435,10 +465,17 @@ drawtext(const char *text, XftColor col[ColLast])
 	int i, j, x, y, h, len, olen;
 	char buf[256];
 	XftDraw *d;
-	XRectangle r = { dc.x, dc.y, dc.w, dc.h };
+	XRectangle tab = { dc.x+separator, dc.y, dc.w-separator, dc.h };
+	XRectangle sep = { dc.x, dc.y, separator, dc.h };
+    XftColor ColSep = getcolor(sepcolor);
 
+	if (separator) {
+		XSetForeground(dpy, dc.gc, ColSep.pixel);
+		XFillRectangles(dpy, dc.drawable, dc.gc, &sep, 1);
+	}
 	XSetForeground(dpy, dc.gc, col[ColBG].pixel);
-	XFillRectangles(dpy, dc.drawable, dc.gc, &r, 1);
+	XFillRectangles(dpy, dc.drawable, dc.gc, &tab, 1);
+
 	if (!text)
 		return;
 
@@ -501,6 +538,7 @@ focus(int c)
 	char buf[BUFSIZ] = "tabbed-"VERSION" ::";
 	size_t i, n;
 	XWMHints* wmh;
+	XWMHints* win_wmh;
 
 	/* If c, sel and clients are -1, raise tabbed-win itself */
 	if (nclients == 0) {
@@ -534,6 +572,17 @@ focus(int c)
 		XSetWMHints(dpy, clients[c]->win, wmh);
 		clients[c]->urgent = False;
 		XFree(wmh);
+
+		/*
+		 * gnome-shell will not stop notifying us about urgency,
+		 * if we clear only the client hint and don't clear the
+		 * hint from the main container window
+		 */
+		if ((win_wmh = XGetWMHints(dpy, win))) {
+			win_wmh->flags &= ~XUrgencyHint;
+			XSetWMHints(dpy, win, win_wmh);
+			XFree(win_wmh);
+		}
 	}
 
 	drawbar();
@@ -609,6 +658,16 @@ getatom(int a)
 	XFree(p);
 
 	return buf;
+}
+
+char *
+getbasename(const char *name)
+{
+	char *pos = strrchr(name, '/');
+	if (pos)
+		return pos+1;
+	else
+		return (char *)name;
 }
 
 int
@@ -728,22 +787,6 @@ keypress(const XEvent *e)
 }
 
 void
-keyrelease(const XEvent *e)
-{
-	const XKeyEvent *ev = &e->xkey;
-	unsigned int i;
-	KeySym keysym;
-
-	keysym = XkbKeycodeToKeysym(dpy, (KeyCode)ev->keycode, 0, 0);
-	for (i = 0; i < LENGTH(keyreleases); i++) {
-		if (keysym == keyreleases[i].keysym &&
-		    CLEANMASK(keyreleases[i].mod) == CLEANMASK(ev->state) &&
-		    keyreleases[i].func)
-			keyreleases[i].func(&(keyreleases[i].arg));
-	}
-}
-
-void
 killclient(const Arg *arg)
 {
 	XEvent ev;
@@ -793,18 +836,9 @@ manage(Window w)
 			}
 		}
 
-		for (i = 0; i < LENGTH(keyreleases); i++) {
-			if ((code = XKeysymToKeycode(dpy, keyreleases[i].keysym))) {
-				for (j = 0; j < LENGTH(modifiers); j++) {
-					XGrabKey(dpy, code, keyreleases[i].mod |
-					         modifiers[j], w, True,
-					         GrabModeAsync, GrabModeAsync);
-				}
-			}
-		}
-
 		c = ecalloc(1, sizeof *c);
 		c->win = w;
+		c->pid = nextpid;
 
 		nclients++;
 		clients = erealloc(clients, sizeof(Client *) * nclients);
@@ -1056,15 +1090,22 @@ setup(void)
 	XWMHints *wmh;
 	XClassHint class_hint;
 	XSizeHints *size_hint;
+	struct sigaction sa;
 
-	/* clean up any zombies immediately */
-	sigchld(0);
+	/* do not transform children into zombies when they terminate */
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_NOCLDSTOP | SA_NOCLDWAIT | SA_RESTART;
+	sa.sa_handler = SIG_IGN;
+	sigaction(SIGCHLD, &sa, NULL);
+
+	/* clean up any zombies that might have been inherited */
+	while (waitpid(-1, NULL, WNOHANG) > 0);
 
 	/* init screen */
 	screen = DefaultScreen(dpy);
 	root = RootWindow(dpy, screen);
 	initfont(font);
-	vbh = dc.h = dc.font.height + 2;
+	vbh = dc.h = barHeight;
 
 	/* init atoms */
 	wmatom[WMDelete] = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
@@ -1167,8 +1208,8 @@ setup(void)
 	XMapRaised(dpy, win);
 	XSelectInput(dpy, win, SubstructureNotifyMask | FocusChangeMask |
 	             ButtonPressMask | ExposureMask | KeyPressMask |
-	             KeyReleaseMask | PropertyChangeMask | StructureNotifyMask |
-	             SubstructureRedirectMask | ButtonMotionMask);
+	             PropertyChangeMask | StructureNotifyMask |
+	             SubstructureRedirectMask);
 	xerrorxlib = XSetErrorHandler(xerror);
 
 	class_hint.res_name = wmname;
@@ -1201,29 +1242,26 @@ setup(void)
 }
 
 void
-showbar(const Arg *arg)
-{
-	barvisibility = arg->i;
-	drawbar();
-}
-
-void
-sigchld(int unused)
-{
-	if (signal(SIGCHLD, sigchld) == SIG_ERR)
-		die("%s: cannot install SIGCHLD handler", argv0);
-
-	while (0 < waitpid(-1, NULL, WNOHANG));
-}
-
-void
 spawn(const Arg *arg)
 {
-	if (fork() == 0) {
+	struct sigaction sa;
+
+	char sel_cwd[PATH_MAX];
+
+	pid_t pid = fork();
+	if (pid == 0) {
 		if(dpy)
 			close(ConnectionNumber(dpy));
 
 		setsid();
+		if (sel >= 0 && clients[sel] && clients[sel]->pid > 0 && getpidcwd(getchildpid(clients[sel]->pid), sel_cwd, PATH_MAX) == 0) {
+			chdir(sel_cwd);
+		}
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = 0;
+		sa.sa_handler = SIG_DFL;
+		sigaction(SIGCHLD, &sa, NULL);
+
 		if (arg && arg->v) {
 			execvp(((char **)arg->v)[0], (char **)arg->v);
 			fprintf(stderr, "%s: execvp %s", argv0,
@@ -1235,6 +1273,8 @@ spawn(const Arg *arg)
 		}
 		perror(" failed");
 		exit(0);
+	} else {
+		nextpid = pid;
 	}
 }
 
@@ -1346,6 +1386,8 @@ updatetitle(int c)
 	    sizeof(clients[c]->name)))
 		gettextprop(clients[c]->win, XA_WM_NAME, clients[c]->name,
 		            sizeof(clients[c]->name));
+	if (basenametitles)
+		clients[c]->basename = getbasename(clients[c]->name);
 	if (sel == c)
 		xsettitle(win, clients[c]->name);
 	drawbar();
@@ -1387,7 +1429,7 @@ xsettitle(Window w, const char *str)
 	XTextProperty xtp;
 
 	if (XmbTextListToTextProperty(dpy, (char **)&str, 1,
-	    XCompoundTextStyle, &xtp) == Success) {
+	    XUTF8StringStyle, &xtp) == Success) {
 		XSetTextProperty(dpy, w, &xtp, wmatom[WMName]);
 		XSetTextProperty(dpy, w, &xtp, XA_WM_NAME);
 		XFree(xtp.value);
@@ -1400,6 +1442,59 @@ usage(void)
 	die("usage: %s [-dfksv] [-g geometry] [-n name] [-p [s+/-]pos]\n"
 	    "       [-r narg] [-o color] [-O color] [-t color] [-T color]\n"
 	    "       [-u color] [-U color] command...\n", argv0);
+}
+
+void
+xrdb_load(void)
+{
+	char *xrm;
+	char *type;
+	XrmDatabase xrdb;
+	XrmValue ret;
+	Display *dpy;
+
+	if(!(dpy = XOpenDisplay(NULL)))
+		die("Can't open display\n");
+
+	XrmInitialize();
+	xrm = XResourceManagerString(dpy);
+
+	if (xrm != NULL) {
+		xrdb = XrmGetStringDatabase(xrm);
+		XRESOURCE_LOAD_STRING("font", font);
+		XRESOURCE_LOAD_STRING("normbgcolor", normbgcolor);
+		XRESOURCE_LOAD_STRING("normfgcolor", normfgcolor);
+		XRESOURCE_LOAD_STRING("selbgcolor", selbgcolor);
+		XRESOURCE_LOAD_STRING("selfgcolor", selfgcolor);
+		XRESOURCE_LOAD_STRING("urgbgcolor", urgbgcolor);
+		XRESOURCE_LOAD_STRING("sepcolor", sepcolor);
+		XRESOURCE_LOAD_STRING("before", before);
+		XRESOURCE_LOAD_STRING("after", after);
+		XRESOURCE_LOAD_STRING("titletrim", titletrim);
+		XRESOURCE_LOAD_INTEGER("tabwidth", tabwidth);
+		XRESOURCE_LOAD_INTEGER("barHeight", barHeight);
+		XRESOURCE_LOAD_INTEGER("separator", separator);
+	}
+	XFlush(dpy);
+}
+
+void
+reload(int sig) {
+	xrdb_load();
+	colors_changed=1;
+	signal(SIGUSR1, reload);
+}
+
+void
+writecolors(void) {
+	dc.norm[ColBG] = getcolor(normbgcolor);
+	dc.norm[ColFG] = getcolor(normfgcolor);
+	dc.sel[ColBG] = getcolor(selbgcolor);
+	dc.sel[ColFG] = getcolor(selfgcolor);
+	dc.urg[ColBG] = getcolor(urgbgcolor);
+	dc.urg[ColFG] = getcolor(urgfgcolor);
+
+	colors_changed = 0;
 }
 
 int
@@ -1462,6 +1557,9 @@ main(int argc, char *argv[])
 	case 'u':
 		urgbgcolor = EARGF(usage());
 		break;
+	case 'b':
+		basenametitles = True;
+		break;
 	case 'v':
 		die("tabbed-"VERSION", © 2009-2016 tabbed engineers, "
 		    "see LICENSE for details.\n");
@@ -1483,6 +1581,8 @@ main(int argc, char *argv[])
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("%s: cannot open display\n", argv0);
 
+	xrdb_load();
+	signal(SIGUSR1, reload);
 	setup();
 	printf("0x%lx\n", win);
 	fflush(NULL);

@@ -1,19 +1,22 @@
 /* See LICENSE file for copyright and license details. */
 
 /* appearance */
-static const char font[]        = "monospace:size=9";
+static const char* font         = "monospace:size=9";
 static const char* normbgcolor  = "#222222";
 static const char* normfgcolor  = "#cccccc";
 static const char* selbgcolor   = "#555555";
 static const char* selfgcolor   = "#ffffff";
 static const char* urgbgcolor   = "#111111";
 static const char* urgfgcolor   = "#cc0000";
-static const char before[]      = "<";
-static const char after[]       = ">";
-static const char titletrim[]   = "...";
-static const int  tabwidth      = 200;
+static const char* sepcolor     = "#cc0000";
+static const char* before      = "<";
+static const char* after       = ">";
+static const char* titletrim   = "...";
+static int  tabwidth      = 200;
+static int barHeight	= 24;
 static const Bool foreground    = True;
 static       Bool urgentswitch  = False;
+static int  separator     = 4;
 
 /*
  * Where to place a new tab when it is opened. When npisrelative is True,
@@ -34,7 +37,7 @@ static Bool npisrelative  = False;
 }
 
 #define MODKEY ControlMask
-static Key keys[] = {
+static const Key keys[] = {
 	/* modifier             key        function     argument */
 	{ MODKEY|ShiftMask,     XK_Return, focusonce,   { 0 } },
 	{ MODKEY|ShiftMask,     XK_Return, spawn,       { 0 } },
@@ -63,13 +66,4 @@ static Key keys[] = {
 	{ MODKEY|ShiftMask,     XK_u,      toggle,      { .v = (void*) &urgentswitch } },
 
 	{ 0,                    XK_F11,    fullscreen,  { 0 } },
-
-	{ MODKEY,               XK_Shift_L, showbar,    { .i = 1 } },
-	{ ShiftMask,            XK_Control_L, showbar,    { .i = 1 } },
-};
-
-static Key keyreleases[] = {
-	/* modifier             key          function     argument */
-	{ MODKEY|ShiftMask,     XK_Shift_L,  showbar,     { .i = 0 } },
-	{ MODKEY|ShiftMask,     XK_Control_L,  showbar,     { .i = 0 } },
 };
