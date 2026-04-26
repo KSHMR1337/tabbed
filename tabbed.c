@@ -3,6 +3,9 @@
  */
 
 #include <sys/wait.h>
+#include <sys/select.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -176,7 +179,7 @@ static void (*handler[LASTEvent]) (const XEvent *) = {
 static int bh, obh, wx, wy, ww, wh, vbh;
 static unsigned int numlockmask;
 static Bool running = True, nextfocus, doinitspawn = True,
-            fillagain = False, closelastclient = False,
+            fillagain = False, closelastclient = True,
 			killclientsfirst = False, basenametitles = False;
 static Display *dpy;
 static DC dc;
@@ -198,6 +201,7 @@ static Visual *visual = NULL;
 char *argv0;
 
 static int colors_changed = 0;
+static int reload_pipe[2] = { -1, -1 };
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -396,8 +400,6 @@ drawbar(void)
 	XftColor *col;
 	int c, cc, fc, width, nbh, i;
 	char *name = NULL;
-
-	if (colors_changed == 1) writecolors();
 
 	if (nclients == 0) {
 		dc.x = 0;
@@ -1037,6 +1039,8 @@ void
 run(void)
 {
 	XEvent ev;
+	int xfd = ConnectionNumber(dpy);
+	int maxfd = xfd > reload_pipe[0] ? xfd : reload_pipe[0];
 
 	/* main event loop */
 	XSync(dpy, False);
@@ -1045,9 +1049,34 @@ run(void)
 		spawn(NULL);
 
 	while (running) {
-		XNextEvent(dpy, &ev);
-		if (handler[ev.type])
-			(handler[ev.type])(&ev); /* call handler */
+		fd_set rfds;
+		FD_ZERO(&rfds);
+		FD_SET(xfd, &rfds);
+		if (reload_pipe[0] >= 0)
+			FD_SET(reload_pipe[0], &rfds);
+
+		if (!XPending(dpy) &&
+		    select(maxfd + 1, &rfds, NULL, NULL, NULL) < 0) {
+			if (errno == EINTR)
+				continue;
+			die("%s: select failed\n", argv0);
+		}
+
+		if (reload_pipe[0] >= 0 && FD_ISSET(reload_pipe[0], &rfds)) {
+			char buf[64];
+			while (read(reload_pipe[0], buf, sizeof(buf)) > 0)
+				;
+			xrdb_load();
+			writecolors();
+			drawbar();
+			XSync(dpy, False);
+		}
+
+		while (running && XPending(dpy)) {
+			XNextEvent(dpy, &ev);
+			if (handler[ev.type])
+				(handler[ev.type])(&ev); /* call handler */
+		}
 	}
 }
 
@@ -1480,9 +1509,14 @@ xrdb_load(void)
 
 void
 reload(int sig) {
-	xrdb_load();
-	colors_changed=1;
+	int saved_errno = errno;
+	if (reload_pipe[1] >= 0) {
+		const char byte = 1;
+		while (write(reload_pipe[1], &byte, 1) < 0 && errno == EINTR)
+			;
+	}
 	signal(SIGUSR1, reload);
+	errno = saved_errno;
 }
 
 void
@@ -1582,6 +1616,12 @@ main(int argc, char *argv[])
 		die("%s: cannot open display\n", argv0);
 
 	xrdb_load();
+	if (pipe(reload_pipe) < 0)
+		die("%s: cannot create reload pipe\n", argv0);
+	fcntl(reload_pipe[0], F_SETFL, O_NONBLOCK);
+	fcntl(reload_pipe[1], F_SETFL, O_NONBLOCK);
+	fcntl(reload_pipe[0], F_SETFD, FD_CLOEXEC);
+	fcntl(reload_pipe[1], F_SETFD, FD_CLOEXEC);
 	signal(SIGUSR1, reload);
 	setup();
 	printf("0x%lx\n", win);
